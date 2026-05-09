@@ -1,0 +1,32 @@
+{
+  "name": "fgo-agent",
+  "version": "0.1.0",
+  "description": "FGO full-data CLI and MCP knowledge agent for Atlas Academy and Mooncell data.",
+  "type": "module",
+  "bin": {
+    "fgo": "./dist/src/cli.js",
+    "fgo-agent": "./dist/src/agent-cli.js",
+    "fgo-mcp": "./dist/src/mcp-server.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "pnpm build && NODE_OPTIONS=--no-warnings=ExperimentalWarning node --test dist/tests/*.test.js",
+    "start:mcp": "node --no-warnings=ExperimentalWarning dist/src/mcp-server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

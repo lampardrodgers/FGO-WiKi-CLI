@@ -1,0 +1,9 @@
+.DS_Store
+node_modules/
+dist/
+.fgo-agent/
+data/cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+coverage/
