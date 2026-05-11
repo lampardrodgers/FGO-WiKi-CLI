@@ -68,11 +68,15 @@ fgo-agent "中立善并且狂阶的，蓝卡宝具的带有神性特攻的从者
 fgo-agent --model gpt-5.5 --fast "国服接下来预计有哪些卡池？"
 fgo-agent --mini "国服接下来预计有哪些卡池？"
 fgo-agent --local "中立善，术阶女性从者"
+fgo-agent --continue "继续查刚才那个从者的宝具"
+fgo-agent --clear-session
 fgo-agent --quiet --model gpt-5.5 --fast "国服接下来预计有哪些卡池？"
 fgo-agent --model gpt-5.4-mini --reasoning low "中立善，术阶女性从者"
 ```
 
 `fgo-agent` starts `codex exec`, asks Codex to interpret the question, and then makes Codex call `fgo_ask` or `fgo` CLI commands for facts. Use `fgo ask` when you want raw structured JSON; use `fgo-agent --local` when you want a fast plain-text answer from the structured query layer; use plain `fgo-agent` when you want Codex to do extra interpretation and answer shaping. By default it inherits your Codex config, shows Codex progress in the terminal, ignores stdin, and runs as an ephemeral one-shot session so separate commands do not share chat context. Add `--quiet` or `--silent` when you only want the final answer. `--persist-session` allows Codex to save a resumable run if you explicitly want that. `--fast` enables Codex native `service_tier="fast"` on models that support it, such as `gpt-5.5` and `gpt-5.4`; `--mini` is a separate lightweight model preset. `--model`, `--reasoning`, `--service-tier`, `--profile`, `--lean`, and `--show-config` are available for manual control.
+
+Use `fgo-agent --continue` for lightweight follow-up memory. `fgo-agent` saves recent turns under `.fgo-agent/sessions`, and `--continue` injects only the recent user questions, final answers shown to the user, and compact IDs for visible results. A normal run without `--continue` starts a new follow-up chain, so the next `--continue` only sees that latest standalone turn. Raw tool output, search payloads, and JSON query data are not carried into the next prompt. Use `--clear-session` to reset the default memory. Advanced callers can still use `--session <id>` to keep a separate named memory.
 
 ## MCP Usage
 

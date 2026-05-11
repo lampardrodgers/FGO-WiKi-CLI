@@ -1454,7 +1454,7 @@ async function fetchJsonWithHttpCache(
 ): Promise<FetchJsonWithHttpCacheResult> {
   const headers: Record<string, string> = {
     accept: "application/json",
-    "user-agent": "fgo-agent/0.1.1",
+    "user-agent": "fgo-agent/0.1.2",
   };
   const etag = sourceString(previous, "etag");
   const lastModified = sourceString(previous, "last_modified");

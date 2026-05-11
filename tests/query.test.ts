@@ -7,6 +7,7 @@ import { resolveDbPath } from "../src/config.js";
 import { FgoDatabase } from "../src/db.js";
 import { FgoService } from "../src/service.js";
 import { ingestAtlasPayload } from "../src/sync.js";
+import { VERSION } from "../src/version.js";
 
 async function withFixture(fn: (dataDir: string) => Promise<void> | void): Promise<void> {
   const dataDir = await mkdtemp(path.join(tmpdir(), "fgo-agent-"));
@@ -330,7 +331,7 @@ test("doctor reports version, quest audit, and golden sample status", async () =
     const report = service.doctor("CN");
     service.close();
 
-    assert.equal(report.version, "0.1.0");
+    assert.equal(report.version, VERSION);
     assert.equal(report.ok, true);
     assert.equal(report.questAudit?.indexedQuests, 2);
     assert.equal(report.checks.find((check) => check.id === "golden_moonlight_mine")?.ok, true);

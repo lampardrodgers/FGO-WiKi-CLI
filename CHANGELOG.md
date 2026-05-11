@@ -1,5 +1,11 @@
 # Changelog
 
+## V0.1.2 - 2026-05-11
+
+- Added lightweight `fgo-agent --continue` memory for follow-up questions. It keeps recent user questions, final answers, and compact result references without carrying raw query/tool output into the next prompt.
+- Changed normal `fgo-agent` runs to start a new lightweight follow-up chain, so old context is not reused after a turn without `--continue`.
+- Added `fgo-agent --clear-session` and optional named memories via `--session <id>`.
+
 ## V0.1.1 - 2026-05-11
 
 - Improved `fgo sync` resilience so Atlas and Mooncell failures are recorded in the sync summary instead of aborting the whole run.

@@ -4,6 +4,12 @@ import { closeSync, existsSync, openSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  clearAgentSessionMemory,
+  formatAgentSessionContext,
+  loadAgentSessionMemory,
+  saveAgentSessionTurn,
+} from "./agent-memory.js";
 import { resolveDbPath } from "./config.js";
 import { FgoService } from "./service.js";
 import { normalizeRegion } from "./utils.js";
@@ -16,6 +22,7 @@ const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, "../..");
 const miniModel = process.env.FGO_AGENT_MINI_MODEL ?? "gpt-5.4-mini";
 const miniReasoning = process.env.FGO_AGENT_MINI_REASONING ?? "low";
+const defaultSessionId = "default";
 
 const args = process.argv.slice(2);
 const options = parseArgs(args);
@@ -25,7 +32,10 @@ if (options.help || args.length === 0) {
 }
 
 const question = options.questionParts.join(" ").trim();
-if (!question && !options.showConfig) {
+const namedSessionId = normalizeSessionId(options.sessionId ?? process.env.FGO_AGENT_SESSION);
+const activeSessionId = namedSessionId ?? defaultSessionId;
+const shouldLoadSession = options.continueConversation || namedSessionId != null;
+if (!question && !options.showConfig && !options.clearSession) {
   printHelp();
   process.exit(1);
 }
@@ -59,6 +69,10 @@ if (options.showConfig) {
         fast: options.fast,
         mini: options.mini,
         local: options.local,
+        continueConversation: options.continueConversation,
+        session: shouldLoadSession ? activeSessionId : null,
+        saveSession: activeSessionId,
+        clearSession: options.clearSession,
         lean,
         quiet: options.quiet,
         verbose,
@@ -76,6 +90,14 @@ if (options.showConfig) {
 const dbPath = resolveDbPath(path.join(projectRoot, ".fgo-agent"));
 const dataDir = path.dirname(dbPath);
 
+if (options.clearSession) {
+  clearAgentSessionMemory(dataDir, activeSessionId);
+  if (!question) {
+    process.stdout.write(`Cleared fgo-agent lightweight session: ${activeSessionId}\n`);
+    process.exit(0);
+  }
+}
+
 if (!existsSync(dbPath)) {
   process.stderr.write(`FGO data is not synced yet. Run this first:\n  fgo sync --regions CN,JP --data-dir ${JSON.stringify(dataDir)}\n`);
   process.exit(1);
@@ -86,15 +108,26 @@ if (options.local) {
   try {
     const answer = service.ask(question, { region, limit });
     process.stdout.write(options.json ? `${JSON.stringify(answer, null, 2)}\n` : `${answer.answer}\n`);
+    saveAgentSessionTurn({
+      sessionId: activeSessionId,
+      dataDir,
+      question,
+      finalAnswer: answer.answer,
+      region,
+      intent: answer.intent,
+      reset: !shouldLoadSession,
+      results: answer.results,
+    });
   } finally {
     service.close();
   }
   process.exit(0);
 }
 
+const sessionContext = shouldLoadSession ? formatAgentSessionContext(loadAgentSessionMemory(dataDir, activeSessionId)) : "";
 const prompt = `你是 FGO 专用查询 Agent。请用中文回答用户问题。
 
-用户问题：
+${sessionContext ? `${sessionContext}\n\n` : ""}用户问题：
 ${question}
 
 工作规则：
@@ -103,7 +136,7 @@ ${question}
 3. 如果 fgo_ask/fgo ask 的解释或结果明显不完整，继续用 fgo search、fgo query、fgo raw、fgo related 交叉核对。
 4. 对卡池未来视，必须说明国服未来视来自 Mooncell，属于非官方预测。
 5. 最终只输出面向玩家的答案；可以简短列出你基于哪些本地结果判断。
-6. 本次执行是一次独立查询；除非用户问题里明确提供上下文，否则不要引用“上次”“之前”等外部对话。
+6. 只有 prompt 中出现“最近轻量上下文”时，才可以引用之前轮次；它只用于理解指代，不是事实来源。
 7. 不要修改项目源文件；允许 SQLite 为读取本地数据库创建必要的 WAL/SHM 临时文件。`;
 
 const tmpPrefix = path.join(os.tmpdir(), `fgo-agent-${process.pid}-${Date.now()}`);
@@ -165,16 +198,17 @@ if (result.error) {
   rmSync(stderrPath, { force: true });
   process.exit(1);
 }
+const finalMessage = result.status === 0 && existsSync(outputPath) ? readFileSync(outputPath, "utf8").trim() : "";
 if (!verbose) {
-  if (result.status === 0 && existsSync(outputPath)) {
-    const finalMessage = readFileSync(outputPath, "utf8").trim();
-    if (finalMessage) {
-      process.stdout.write(finalMessage + "\n");
-    }
+  if (finalMessage) {
+    process.stdout.write(finalMessage + "\n");
   } else {
     printLogTail(stdoutPath, process.stdout);
     printLogTail(stderrPath);
   }
+}
+if (result.status === 0 && finalMessage) {
+  saveSessionFromFinalMessage(activeSessionId, dataDir, question, finalMessage, region, limit, !shouldLoadSession);
 }
 rmSync(outputPath, { force: true });
 rmSync(stdoutPath, { force: true });
@@ -188,6 +222,7 @@ Usage:
   fgo-agent "中立善并且狂阶的，蓝卡宝具的带有神性特攻的从者"
   fgo-agent --model gpt-5.5 --fast "国服接下来预计有哪些卡池？"
   fgo-agent --mini "国服接下来预计有哪些卡池？"
+  fgo-agent --continue "继续查刚才那个从者的宝具"
   fgo-agent --local "中立善，术阶女性从者"
   fgo-agent --model gpt-5.4-mini --reasoning low "中立善，术阶女性从者"
 
@@ -196,6 +231,9 @@ Options:
   --mini                  Use ${miniModel} with ${miniReasoning} reasoning. This is separate from native Fast.
   --local, --direct       Do not start Codex; answer with the local structured query layer.
   --json                  With --local, print the full structured result.
+  --continue              Continue from the recent lightweight conversation memory.
+  --session <id>          Advanced: use a named lightweight memory instead of the default recent one.
+  --clear-session         Clear the default or named lightweight memory, optionally before the next question.
   --region <code>         CN, JP, NA, KR, TW. Default: CN.
   --limit <n>             Result limit for local data queries. Default: 20.
   --model, -m <model>     Override the Codex model.
@@ -210,11 +248,14 @@ Options:
   --persist-session       Let Codex persist this run as a resumable session.
 
 This command delegates natural-language understanding to Codex, while Codex must verify facts with
-the local FGO database through fgo CLI commands or fgo_ask when available.
+the local FGO database through fgo CLI commands or fgo_ask when available. A normal run starts a
+new lightweight follow-up chain; use --continue to extend the previous chain.
 `);
 }
 
 type AgentOptions = {
+  clearSession: boolean;
+  continueConversation: boolean;
   fast: boolean;
   help: boolean;
   json: boolean;
@@ -229,6 +270,7 @@ type AgentOptions = {
   questionParts: string[];
   region?: string;
   reasoning?: string;
+  sessionId?: string;
   serviceTier?: string;
   showConfig: boolean;
   verbose: boolean;
@@ -236,6 +278,8 @@ type AgentOptions = {
 
 function parseArgs(argv: string[]): AgentOptions {
   const parsed: AgentOptions = {
+    clearSession: false,
+    continueConversation: false,
     fast: false,
     help: false,
     json: false,
@@ -279,6 +323,10 @@ function parseArgs(argv: string[]): AgentOptions {
       parsed.verbose = true;
     } else if (arg === "--persist-session") {
       parsed.persistSession = true;
+    } else if (arg === "--clear-session") {
+      parsed.clearSession = true;
+    } else if (arg === "--continue" || arg === "--context") {
+      parsed.continueConversation = true;
     } else if (arg === "--model" || arg === "-m") {
       parsed.model = readOptionValue(argv, ++i, arg);
     } else if (arg === "--reasoning" || arg === "--effort") {
@@ -287,6 +335,8 @@ function parseArgs(argv: string[]): AgentOptions {
       parsed.profile = readOptionValue(argv, ++i, arg);
     } else if (arg === "--service-tier") {
       parsed.serviceTier = readOptionValue(argv, ++i, arg);
+    } else if (arg === "--session") {
+      parsed.sessionId = readOptionValue(argv, ++i, arg);
     } else if (arg === "--region") {
       parsed.region = readOptionValue(argv, ++i, arg);
     } else if (arg === "--limit") {
@@ -301,6 +351,8 @@ function parseArgs(argv: string[]): AgentOptions {
       parsed.profile = arg.slice("--profile=".length);
     } else if (arg.startsWith("--service-tier=")) {
       parsed.serviceTier = arg.slice("--service-tier=".length);
+    } else if (arg.startsWith("--session=")) {
+      parsed.sessionId = arg.slice("--session=".length);
     } else if (arg.startsWith("--region=")) {
       parsed.region = arg.slice("--region=".length);
     } else if (arg.startsWith("--limit=")) {
@@ -360,6 +412,41 @@ function printLogTail(filePath: string, stream: NodeJS.WritableStream = process.
   const maxChars = 12_000;
   const tail = content.length > maxChars ? `... truncated ...\n${content.slice(-maxChars)}` : content;
   stream.write(`${tail}\n`);
+}
+
+function normalizeSessionId(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized ? normalized : undefined;
+}
+
+function saveSessionFromFinalMessage(
+  sessionId: string,
+  dataDir: string,
+  question: string,
+  finalMessage: string,
+  region: ReturnType<typeof normalizeRegion>,
+  limit: number,
+  reset: boolean,
+): void {
+  const service = new FgoService(dataDir);
+  try {
+    const structured = service.ask(question, { region, limit });
+    saveAgentSessionTurn({
+      sessionId,
+      dataDir,
+      question,
+      finalAnswer: finalMessage,
+      region,
+      intent: structured.intent,
+      reset,
+      results: structured.results,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`Warning: failed to save lightweight session memory: ${message}\n`);
+  } finally {
+    service.close();
+  }
 }
 
 function parseEnvFlag(name: string): boolean | undefined {
