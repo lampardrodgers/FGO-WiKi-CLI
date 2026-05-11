@@ -37,6 +37,7 @@ FGO_AGENT_DATA_DIR=/path/to/fgo-data fgo sync --regions CN,JP
 ```
 
 The sync stores raw JSON cache files and a SQLite database. It indexes resource URLs but does not download media files.
+Subsequent syncs use upstream ETag/Last-Modified metadata when available and skip unchanged exports instead of rebuilding their indexes. Use `--force` when you intentionally want to re-download and rebuild everything.
 
 ## CLI Examples
 

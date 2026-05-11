@@ -146,6 +146,7 @@ export interface SyncOptions {
   includeMooncell?: boolean;
   includeAssets?: boolean;
   concurrency?: number;
+  force?: boolean;
   verbose?: boolean;
 }
 

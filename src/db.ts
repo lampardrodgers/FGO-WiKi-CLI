@@ -61,6 +61,8 @@ export class FgoDatabase {
         kind TEXT NOT NULL,
         url TEXT NOT NULL,
         hash TEXT,
+        etag TEXT,
+        last_modified TEXT,
         fetched_at TEXT NOT NULL,
         status TEXT NOT NULL,
         error TEXT
@@ -210,6 +212,19 @@ export class FgoDatabase {
       CREATE INDEX IF NOT EXISTS idx_quest_index_bond
         ON quest_index(region, quest_type, bond);
     `);
+    this.ensureSourceHttpCacheColumns();
+  }
+
+  private ensureSourceHttpCacheColumns(): void {
+    const columns = new Set(
+      (this.db.prepare(`PRAGMA table_info(sources)`).all() as Row[]).map((row) => String(row.name)),
+    );
+    if (!columns.has("etag")) {
+      this.db.exec(`ALTER TABLE sources ADD COLUMN etag TEXT`);
+    }
+    if (!columns.has("last_modified")) {
+      this.db.exec(`ALTER TABLE sources ADD COLUMN last_modified TEXT`);
+    }
   }
 
   setMetadata(key: string, value: unknown, updatedAt: string): void {
@@ -235,20 +250,24 @@ export class FgoDatabase {
     kind: string;
     url: string;
     hash?: string;
+    etag?: string;
+    lastModified?: string;
     fetchedAt: string;
     status: string;
     error?: string;
   }): void {
     this.db
       .prepare(
-        `INSERT INTO sources(id, region, source, kind, url, hash, fetched_at, status, error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO sources(id, region, source, kind, url, hash, etag, last_modified, fetched_at, status, error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            region = excluded.region,
            source = excluded.source,
            kind = excluded.kind,
            url = excluded.url,
            hash = excluded.hash,
+           etag = excluded.etag,
+           last_modified = excluded.last_modified,
            fetched_at = excluded.fetched_at,
            status = excluded.status,
            error = excluded.error`,
@@ -260,10 +279,16 @@ export class FgoDatabase {
         input.kind,
         input.url,
         input.hash ?? null,
+        input.etag ?? null,
+        input.lastModified ?? null,
         input.fetchedAt,
         input.status,
         input.error ?? null,
       );
+  }
+
+  getSource(id: string): Record<string, unknown> | undefined {
+    return this.db.prepare(`SELECT * FROM sources WHERE id = ?`).get(id) as Row | undefined;
   }
 
   upsertEntity(record: EntityRecord, options: { ftsAlreadyCleared?: boolean } = {}): void {
@@ -610,6 +635,29 @@ export class FgoDatabase {
       entityType: String((row as Row).entityType),
       count: Number((row as Row).count),
     }));
+  }
+
+  countEntities(region?: Region): number {
+    return this.countRows("entities", region);
+  }
+
+  countResources(region?: Region): number {
+    return this.countRows("resources", region);
+  }
+
+  countBanners(region?: Region): number {
+    return this.countRows("banners", region);
+  }
+
+  countQuestIndex(region?: Region): number {
+    return this.countRows("quest_index", region);
+  }
+
+  private countRows(table: "entities" | "resources" | "banners" | "quest_index", region?: Region): number {
+    const row = region
+      ? (this.db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE region = ?`).get(region) as Row | undefined)
+      : (this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as Row | undefined);
+    return Number(row?.count ?? 0);
   }
 
   searchEntities(query: string, options: SearchOptions = {}): EntityResult[] {

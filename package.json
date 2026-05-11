@@ -1,6 +1,6 @@
 {
   "name": "fgo-agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "FGO full-data CLI and MCP knowledge agent for Atlas Academy and Mooncell data.",
   "type": "module",
   "bin": {

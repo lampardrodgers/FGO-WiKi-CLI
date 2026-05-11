@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ensureDataDirs, resolveCacheDir, resolveDbPath } from "./config.js";
 import { FgoDatabase } from "./db.js";
@@ -19,6 +19,51 @@ interface AtlasExportConfig {
   file: string;
   kind: "basic" | "nice" | "asset" | "static";
   regions?: Region[];
+}
+
+type SyncStatus = "ok" | "partial" | "failed" | "skipped";
+
+interface SourceSyncStats {
+  total: number;
+  fetched: number;
+  unchanged: number;
+  skipped: number;
+  failed: number;
+}
+
+interface SyncFailure {
+  id: string;
+  source: "atlas" | "mooncell";
+  kind: string;
+  region?: Region;
+  url: string;
+  error: string;
+}
+
+interface SyncDatabaseSummary {
+  name: "atlas" | "mooncell" | "quest_index";
+  status: SyncStatus;
+  message: string;
+  stats?: SourceSyncStats;
+  regions?: Array<{
+    region: Region;
+    indexedQuests?: number;
+    failedQuestDetails?: number;
+    candidateQuests?: number;
+  }>;
+}
+
+interface SyncCountSummary {
+  regions: Array<{
+    region: Region;
+    totalEntities: number;
+    entityTypes: number;
+    entities: Record<string, number>;
+    otherEntities: number;
+    questIndex: number;
+    banners: number;
+    resources: number;
+  }>;
 }
 
 const ATLAS_BASE = "https://api.atlasacademy.io";
@@ -49,14 +94,21 @@ const ATLAS_EXPORTS: AtlasExportConfig[] = [
 ];
 
 export interface SyncSummary {
+  status: SyncStatus;
+  message: string;
   dbPath: string;
   regions: Region[];
+  completedAt?: string;
   fetched: number;
+  unchanged: number;
   skipped: number;
   failed: number;
   entities: number;
   banners: number;
   questAudits: QuestIndexAudit[];
+  databases: SyncDatabaseSummary[];
+  counts?: SyncCountSummary;
+  failures: SyncFailure[];
 }
 
 export async function syncAll(options: SyncOptions): Promise<SyncSummary> {
@@ -64,23 +116,67 @@ export async function syncAll(options: SyncOptions): Promise<SyncSummary> {
   const includeNice = options.includeNice ?? true;
   const includeMooncell = options.includeMooncell ?? true;
   const includeAssets = options.includeAssets ?? true;
+  const atlasStats = emptySourceSyncStats();
+  const mooncellStats = emptySourceSyncStats();
+  const failures: SyncFailure[] = [];
+  let mooncellStatus: SyncStatus = includeMooncell && options.regions.includes("CN") ? "skipped" : "skipped";
   await ensureDataDirs(options.dataDir);
   const db = new FgoDatabase(resolveDbPath(options.dataDir));
   const summary: SyncSummary = {
+    status: "ok",
+    message: "Sync not finished.",
     dbPath: resolveDbPath(options.dataDir),
     regions: options.regions,
     fetched: 0,
+    unchanged: 0,
     skipped: 0,
     failed: 0,
     entities: 0,
     banners: 0,
     questAudits: [],
+    databases: [],
+    failures,
   };
 
   try {
-    const fetchedAt = nowIso();
-    const info = await fetchJson(`${ATLAS_BASE}/info`);
-    db.setMetadata("atlas.info", info, fetchedAt);
+    const infoUrl = `${ATLAS_BASE}/info`;
+    atlasStats.total += 1;
+    try {
+      const fetchedAt = nowIso();
+      const info = await fetchJson(infoUrl);
+      db.setMetadata("atlas.info", info, fetchedAt);
+      db.upsertSource({
+        id: "atlas:info",
+        source: "atlas",
+        kind: "metadata",
+        url: infoUrl,
+        hash: hashText(stringifyJson(info)),
+        fetchedAt,
+        status: "ok",
+      });
+      atlasStats.fetched += 1;
+      summary.fetched += 1;
+    } catch (error) {
+      const message = errorMessage(error);
+      summary.failed += 1;
+      atlasStats.failed += 1;
+      failures.push({
+        id: "atlas:info",
+        source: "atlas",
+        kind: "metadata",
+        url: infoUrl,
+        error: message,
+      });
+      db.upsertSource({
+        id: "atlas:info",
+        source: "atlas",
+        kind: "metadata",
+        url: infoUrl,
+        fetchedAt: nowIso(),
+        status: "failed",
+        error: message,
+      });
+    }
 
     for (const region of options.regions) {
       for (const config of ATLAS_EXPORTS) {
@@ -88,58 +184,117 @@ export async function syncAll(options: SyncOptions): Promise<SyncSummary> {
         if (config.kind === "basic" && !includeBasic) continue;
         if (config.kind === "nice" && !includeNice) continue;
         if (config.kind === "asset" && !includeAssets) continue;
+        atlasStats.total += 1;
         const url = `${ATLAS_BASE}/export/${region}/${config.file}`;
+        const sourceId = `atlas:${region}:${config.file}`;
         if (options.verbose) console.error(`[sync] ${region} ${config.file}`);
+        const previous = db.getSource(sourceId);
         try {
-          const payload = await fetchJson(url);
-          const text = stringifyJson(payload);
-          await writeCache(options.dataDir, region, config.file, text);
-          const count = ingestAtlasPayload(db, {
-            region,
-            entityType: config.entityType,
-            payload,
-            sourceUrl: url,
-            updatedAt: nowIso(),
-          });
-          if (config.entityType === "war" && config.kind === "nice") {
-            const questSync = await syncQuestIndex(db, {
+          const fetched = await fetchJsonWithHttpCache(url, options.force ? undefined : previous);
+          const previousHash = sourceString(previous, "hash");
+          const etag = fetched.status === "not_modified" ? fetched.etag ?? sourceString(previous, "etag") : fetched.etag;
+          const lastModified =
+            fetched.status === "not_modified"
+              ? fetched.lastModified ?? sourceString(previous, "last_modified")
+              : fetched.lastModified;
+          if (fetched.status === "not_modified") {
+            let hash = previousHash;
+            if (isQuestIndexSource(config)) {
+              const cached = await readCachedJson(options.dataDir, region, config.file);
+              if (cached) {
+                await refreshQuestIndex(db, summary, {
+                  region,
+                  payload: cached.payload,
+                  dataDir: options.dataDir,
+                  verbose: options.verbose,
+                });
+              } else {
+                const refetched = await fetchModifiedJson(url);
+                hash = hashText(refetched.text);
+                await ingestFetchedAtlasExport(db, summary, {
+                  region,
+                  config,
+                  payload: refetched.payload,
+                  text: refetched.text,
+                  hash,
+                  etag: refetched.etag,
+                  lastModified: refetched.lastModified,
+                  url,
+                  sourceId,
+                  dataDir: options.dataDir,
+                  verbose: options.verbose,
+                  stats: atlasStats,
+                });
+                continue;
+              }
+            }
+            db.upsertSource({
+              id: sourceId,
               region,
-              payload,
-              dataDir: options.dataDir,
-              verbose: options.verbose,
-              updatedAt: nowIso(),
+              source: "atlas",
+              kind: config.kind,
+              url,
+              hash,
+              etag,
+              lastModified,
+              fetchedAt: nowIso(),
+              status: "unchanged",
             });
-            summary.questAudits.push(questSync.audit);
-            if (questSync.indexed > 0) {
-              db.upsertSource({
-                id: `atlas:${region}:quest_index`,
+            summary.unchanged += 1;
+            atlasStats.unchanged += 1;
+            continue;
+          }
+
+          const text = fetched.text;
+          const hash = hashText(text);
+          if (!options.force && previousHash === hash) {
+            await writeCache(options.dataDir, region, config.file, text);
+            if (isQuestIndexSource(config)) {
+              await refreshQuestIndex(db, summary, {
                 region,
-                source: "atlas",
-                kind: "quest_index",
-                url: `${ATLAS_BASE}/nice/${region}/quest/{questId}/{phase}`,
-                fetchedAt: nowIso(),
-                status: "ok",
+                payload: fetched.payload,
+                dataDir: options.dataDir,
+                verbose: options.verbose,
               });
             }
+            db.upsertSource({
+              id: sourceId,
+              region,
+              source: "atlas",
+              kind: config.kind,
+              url,
+              hash,
+              etag,
+              lastModified,
+              fetchedAt: nowIso(),
+              status: "unchanged",
+            });
+            summary.unchanged += 1;
+            atlasStats.unchanged += 1;
+            continue;
           }
-          db.upsertSource({
-            id: `atlas:${region}:${config.file}`,
+
+          await ingestFetchedAtlasExport(db, summary, {
             region,
-            source: "atlas",
-            kind: config.kind,
+            config,
+            payload: fetched.payload,
+            text,
+            hash,
+            etag,
+            lastModified,
             url,
-            hash: hashText(text),
-            fetchedAt: nowIso(),
-            status: "ok",
+            sourceId,
+            dataDir: options.dataDir,
+            verbose: options.verbose,
+            stats: atlasStats,
           });
-          summary.fetched += 1;
-          summary.entities += count;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (message.includes("HTTP 404")) {
             summary.skipped += 1;
+            atlasStats.skipped += 1;
             db.upsertSource({
-              id: `atlas:${region}:${config.file}`,
+              id: sourceId,
               region,
               source: "atlas",
               kind: config.kind,
@@ -150,12 +305,24 @@ export async function syncAll(options: SyncOptions): Promise<SyncSummary> {
             });
           } else {
             summary.failed += 1;
+            atlasStats.failed += 1;
+            failures.push({
+              id: sourceId,
+              source: "atlas",
+              kind: config.kind,
+              region,
+              url,
+              error: message,
+            });
             db.upsertSource({
-              id: `atlas:${region}:${config.file}`,
+              id: sourceId,
               region,
               source: "atlas",
               kind: config.kind,
               url,
+              hash: sourceString(previous, "hash"),
+              etag: sourceString(previous, "etag"),
+              lastModified: sourceString(previous, "last_modified"),
               fetchedAt: nowIso(),
               status: "failed",
               error: message,
@@ -166,41 +333,311 @@ export async function syncAll(options: SyncOptions): Promise<SyncSummary> {
     }
 
     if (includeMooncell && options.regions.includes("CN")) {
+      mooncellStats.total += 1;
       if (options.verbose) console.error("[sync] Mooncell future banners");
-      const banners = await fetchMooncellBanners();
-      db.transaction(() => {
-        for (const banner of banners) {
-          db.upsertBanner(banner);
-          db.upsertEntity({
+      const sourceId = "mooncell:CN:banners";
+      const previous = db.getSource(sourceId);
+      try {
+        const banners = await fetchMooncellBanners();
+        const hash = hashMooncellBanners(banners);
+        if (!options.force && sourceString(previous, "hash") === hash) {
+          db.upsertSource({
+            id: sourceId,
             region: "CN",
-            entityType: "banner",
-            entityId: banner.id,
-            name: banner.title,
-            aliases: uniqueStrings([banner.title, ...banner.pickupServants]),
-            summary: `${banner.title} ${banner.startAt ?? ""} ~ ${banner.endAt ?? ""} ${banner.pickupServants.join(" ")}`,
-            rawJson: banner.rawJson,
-            sourceUrl: banner.sourceUrl,
-            updatedAt: banner.updatedAt,
+            source: "mooncell",
+            kind: "banner",
+            url: MOONCELL_API,
+            hash,
+            fetchedAt: nowIso(),
+            status: "unchanged",
           });
+          summary.unchanged += 1;
+          mooncellStats.unchanged += 1;
+          mooncellStatus = "ok";
+        } else {
+          db.transaction(() => {
+            for (const banner of banners) {
+              db.upsertBanner(banner);
+              db.upsertEntity({
+                region: "CN",
+                entityType: "banner",
+                entityId: banner.id,
+                name: banner.title,
+                aliases: uniqueStrings([banner.title, ...banner.pickupServants]),
+                summary: `${banner.title} ${banner.startAt ?? ""} ~ ${banner.endAt ?? ""} ${banner.pickupServants.join(" ")}`,
+                rawJson: banner.rawJson,
+                sourceUrl: banner.sourceUrl,
+                updatedAt: banner.updatedAt,
+              });
+            }
+          });
+          db.upsertSource({
+            id: sourceId,
+            region: "CN",
+            source: "mooncell",
+            kind: "banner",
+            url: MOONCELL_API,
+            hash,
+            fetchedAt: nowIso(),
+            status: "ok",
+          });
+          summary.banners = banners.length;
+          mooncellStats.fetched += 1;
+          mooncellStatus = "ok";
         }
-      });
-      db.upsertSource({
-        id: "mooncell:CN:banners",
-        region: "CN",
-        source: "mooncell",
-        kind: "banner",
-        url: MOONCELL_API,
-        hash: hashText(stringifyJson(banners)),
-        fetchedAt: nowIso(),
-        status: "ok",
-      });
-      summary.banners = banners.length;
+      } catch (error) {
+        const message = errorMessage(error);
+        summary.failed += 1;
+        mooncellStats.failed += 1;
+        mooncellStatus = "failed";
+        failures.push({
+          id: sourceId,
+          source: "mooncell",
+          kind: "banner",
+          region: "CN",
+          url: MOONCELL_API,
+          error: message,
+        });
+        db.upsertSource({
+          id: sourceId,
+          region: "CN",
+          source: "mooncell",
+          kind: "banner",
+          url: MOONCELL_API,
+          hash: sourceString(previous, "hash"),
+          fetchedAt: nowIso(),
+          status: "failed",
+          error: message,
+        });
+      }
     }
+    finalizeSyncSummary(db, summary, {
+      atlasStats,
+      includeMooncell,
+      mooncellStatus,
+      mooncellStats,
+    });
   } finally {
     db.close();
   }
 
   return summary;
+}
+
+function emptySourceSyncStats(): SourceSyncStats {
+  return {
+    total: 0,
+    fetched: 0,
+    unchanged: 0,
+    skipped: 0,
+    failed: 0,
+  };
+}
+
+function finalizeSyncSummary(
+  db: FgoDatabase,
+  summary: SyncSummary,
+  input: {
+    atlasStats: SourceSyncStats;
+    includeMooncell: boolean;
+    mooncellStatus: SyncStatus;
+    mooncellStats: SourceSyncStats;
+  },
+): void {
+  const atlasStatus: SyncStatus = input.atlasStats.failed > 0 ? "partial" : "ok";
+  const questIndexStatus = questIndexSyncStatus(summary);
+  summary.completedAt = nowIso();
+  summary.counts = {
+    regions: summary.regions.map((region) => {
+      const entityCounts = db.listEntityTypes(region);
+      const selectedEntities = selectSummaryEntityCounts(entityCounts);
+      return {
+        region,
+        totalEntities: db.countEntities(region),
+        entityTypes: entityCounts.length,
+        entities: selectedEntities.counts,
+        otherEntities: selectedEntities.other,
+        questIndex: db.countQuestIndex(region),
+        banners: db.countBanners(region),
+        resources: db.countResources(region),
+      };
+    }),
+  };
+  summary.databases = [
+    {
+      name: "atlas",
+      status: atlasStatus,
+      message: sourceStatsMessage("Atlas", input.atlasStats),
+      stats: { ...input.atlasStats },
+    },
+    {
+      name: "quest_index",
+      status: questIndexStatus,
+      message: questIndexMessage(summary),
+      regions: summary.questAudits.map((audit) => ({
+        region: audit.region,
+        indexedQuests: audit.indexedQuests,
+        failedQuestDetails: audit.failedQuestDetails,
+        candidateQuests: audit.candidateQuests,
+      })),
+    },
+    {
+      name: "mooncell",
+      status: input.includeMooncell && summary.regions.includes("CN") ? input.mooncellStatus : "skipped",
+      message: mooncellMessage(summary, input.includeMooncell),
+      stats:
+        input.includeMooncell && summary.regions.includes("CN")
+          ? { ...input.mooncellStats }
+          : { total: 0, fetched: 0, unchanged: 0, skipped: 1, failed: 0 },
+    },
+  ];
+  summary.status = summary.failed > 0 ? "partial" : "ok";
+  summary.message =
+    summary.status === "ok"
+      ? `同步完成：${summary.fetched} 个数据源已更新，${summary.unchanged} 个数据源未变化。`
+      : `同步完成但有 ${summary.failed} 个数据源失败；可用 fgo status --limit 10 查看明细。`;
+}
+
+function selectSummaryEntityCounts(entityCounts: Array<{ entityType: string; count: number }>): {
+  counts: Record<string, number>;
+  other: number;
+} {
+  const preferred = new Set([
+    "servant",
+    "equip",
+    "event",
+    "war",
+    "item",
+    "command_code",
+    "mystic_code",
+    "asset_storage",
+    "trait",
+    "banner",
+  ]);
+  const counts: Record<string, number> = {};
+  let other = 0;
+  for (const item of entityCounts) {
+    if (preferred.has(item.entityType)) {
+      counts[item.entityType] = item.count;
+    } else {
+      other += item.count;
+    }
+  }
+  return { counts, other };
+}
+
+function sourceStatsMessage(name: string, stats: SourceSyncStats): string {
+  if (stats.failed > 0) {
+    return `${name} 部分完成：${stats.fetched} 个更新，${stats.unchanged} 个未变化，${stats.failed} 个失败，${stats.skipped} 个跳过。`;
+  }
+  return `${name} 正常：${stats.fetched} 个更新，${stats.unchanged} 个未变化，${stats.skipped} 个跳过。`;
+}
+
+function questIndexSyncStatus(summary: SyncSummary): SyncStatus {
+  if (summary.questAudits.length === 0) return "skipped";
+  return summary.questAudits.some((audit) => audit.failedQuestDetails > 0 || audit.indexedQuests === 0) ? "partial" : "ok";
+}
+
+function questIndexMessage(summary: SyncSummary): string {
+  if (summary.questAudits.length === 0) return "quest_index 未刷新；通常是未同步 nice_war 或本次未包含 nice 数据。";
+  const details = summary.questAudits
+    .map((audit) => `${audit.region}: ${audit.indexedQuests}/${audit.candidateQuests} 个常驻自由本`)
+    .join("，");
+  return `quest_index 已刷新：${details}。`;
+}
+
+function mooncellMessage(summary: SyncSummary, includeMooncell: boolean): string {
+  if (!includeMooncell || !summary.regions.includes("CN")) return "Mooncell 未启用或本次未同步 CN。";
+  const failure = summary.failures.find((item) => item.source === "mooncell");
+  if (failure) return `Mooncell 同步失败：${failure.error}`;
+  if (summary.banners > 0) return `Mooncell 正常：更新 ${summary.banners} 个预测卡池。`;
+  return "Mooncell 正常：预测卡池数据未变化。";
+}
+
+function isQuestIndexSource(config: AtlasExportConfig): boolean {
+  return config.entityType === "war" && config.kind === "nice";
+}
+
+async function ingestFetchedAtlasExport(
+  db: FgoDatabase,
+  summary: SyncSummary,
+  input: {
+    region: Region;
+    config: AtlasExportConfig;
+    payload: unknown;
+    text: string;
+    hash: string;
+    etag?: string;
+    lastModified?: string;
+    url: string;
+    sourceId: string;
+    dataDir?: string;
+    verbose?: boolean;
+    stats?: SourceSyncStats;
+  },
+): Promise<void> {
+  await writeCache(input.dataDir, input.region, input.config.file, input.text);
+  const count = ingestAtlasPayload(db, {
+    region: input.region,
+    entityType: input.config.entityType,
+    payload: input.payload,
+    sourceUrl: input.url,
+    updatedAt: nowIso(),
+  });
+  if (isQuestIndexSource(input.config)) {
+    await refreshQuestIndex(db, summary, {
+      region: input.region,
+      payload: input.payload,
+      dataDir: input.dataDir,
+      verbose: input.verbose,
+    });
+  }
+  db.upsertSource({
+    id: input.sourceId,
+    region: input.region,
+    source: "atlas",
+    kind: input.config.kind,
+    url: input.url,
+    hash: input.hash,
+    etag: input.etag,
+    lastModified: input.lastModified,
+    fetchedAt: nowIso(),
+    status: "ok",
+  });
+  summary.fetched += 1;
+  summary.entities += count;
+  if (input.stats) input.stats.fetched += 1;
+}
+
+async function refreshQuestIndex(
+  db: FgoDatabase,
+  summary: SyncSummary,
+  input: {
+    region: Region;
+    payload: unknown;
+    dataDir?: string;
+    verbose?: boolean;
+  },
+): Promise<void> {
+  const questSync = await syncQuestIndex(db, {
+    region: input.region,
+    payload: input.payload,
+    dataDir: input.dataDir,
+    verbose: input.verbose,
+    updatedAt: nowIso(),
+  });
+  summary.questAudits.push(questSync.audit);
+  if (questSync.indexed > 0) {
+    db.upsertSource({
+      id: `atlas:${input.region}:quest_index`,
+      region: input.region,
+      source: "atlas",
+      kind: "quest_index",
+      url: `${ATLAS_BASE}/nice/${input.region}/quest/{questId}/{phase}`,
+      fetchedAt: nowIso(),
+      status: "ok",
+    });
+  }
 }
 
 export function ingestAtlasPayload(
@@ -981,17 +1418,114 @@ function arrayValues(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
+type FetchJsonWithHttpCacheResult =
+  | {
+      status: "modified";
+      payload: unknown;
+      text: string;
+      etag?: string;
+      lastModified?: string;
+    }
+  | {
+      status: "not_modified";
+      etag?: string;
+      lastModified?: string;
+    };
+
 async function fetchJson(url: string): Promise<unknown> {
-  const response = await fetch(url, {
-    headers: {
-      accept: "application/json",
-      "user-agent": "fgo-agent/0.1.0",
-    },
-  });
+  const fetched = await fetchJsonWithHttpCache(url);
+  if (fetched.status === "not_modified") {
+    throw new Error(`HTTP 304 Not Modified without cache handler: ${url}`);
+  }
+  return fetched.payload;
+}
+
+async function fetchModifiedJson(url: string): Promise<Extract<FetchJsonWithHttpCacheResult, { status: "modified" }>> {
+  const fetched = await fetchJsonWithHttpCache(url);
+  if (fetched.status === "not_modified") {
+    throw new Error(`HTTP 304 Not Modified without cache handler: ${url}`);
+  }
+  return fetched;
+}
+
+async function fetchJsonWithHttpCache(
+  url: string,
+  previous?: Record<string, unknown>,
+): Promise<FetchJsonWithHttpCacheResult> {
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    "user-agent": "fgo-agent/0.1.1",
+  };
+  const etag = sourceString(previous, "etag");
+  const lastModified = sourceString(previous, "last_modified");
+  if (etag) headers["if-none-match"] = etag;
+  if (lastModified) headers["if-modified-since"] = lastModified;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers });
+  } catch (error) {
+    throw new Error(`Fetch failed for ${url}: ${errorMessage(error)}`);
+  }
+  const nextEtag = response.headers.get("etag") ?? undefined;
+  const nextLastModified = response.headers.get("last-modified") ?? undefined;
+  if (response.status === 304) {
+    return {
+      status: "not_modified",
+      etag: nextEtag ?? etag,
+      lastModified: nextLastModified ?? lastModified,
+    };
+  }
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} ${response.statusText}: ${url}`);
   }
-  return response.json() as Promise<unknown>;
+  const text = await response.text();
+  try {
+    return {
+      status: "modified",
+      payload: JSON.parse(text) as unknown,
+      text,
+      etag: nextEtag,
+      lastModified: nextLastModified,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid JSON from ${url}: ${message}`);
+  }
+}
+
+function sourceString(source: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = source?.[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  if (cause instanceof Error && cause.message) return `${error.message}: ${cause.message}`;
+  return error.message;
+}
+
+async function readCachedJson(
+  dataDir: string | undefined,
+  region: Region,
+  file: string,
+): Promise<{ payload: unknown; text: string } | undefined> {
+  const cachePath = path.join(resolveCacheDir(dataDir), region, file);
+  try {
+    const text = await readFile(cachePath, "utf8");
+    return { payload: JSON.parse(text) as unknown, text };
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    if (error instanceof SyntaxError) {
+      throw new Error(`Invalid cached JSON from ${cachePath}: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 async function writeCache(dataDir: string | undefined, region: Region, file: string, text: string): Promise<void> {
@@ -1013,6 +1547,26 @@ interface MooncellBanner {
   sourceUrl: string;
   rawJson: unknown;
   updatedAt: string;
+}
+
+function hashMooncellBanners(banners: MooncellBanner[]): string {
+  return hashText(
+    stringifyJson(
+      banners.map((banner) => ({
+        id: banner.id,
+        region: banner.region,
+        title: banner.title,
+        startAt: banner.startAt,
+        endAt: banner.endAt,
+        pickupServants: banner.pickupServants,
+        pickupCEs: banner.pickupCEs,
+        confidence: banner.confidence,
+        source: banner.source,
+        sourceUrl: banner.sourceUrl,
+        rawJson: banner.rawJson,
+      })),
+    ),
+  );
 }
 
 async function fetchMooncellBanners(): Promise<MooncellBanner[]> {

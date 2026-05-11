@@ -1,4 +1,5 @@
 #!/usr/bin/env -S node --no-warnings=ExperimentalWarning
+import type { SyncSummary } from "./sync.js";
 import { normalizeRegion, parseRegions } from "./utils.js";
 import { installSqliteWarningFilter } from "./warnings.js";
 
@@ -32,9 +33,14 @@ async function main(): Promise<void> {
       includeNice: !boolOpt(args, "no-nice"),
       includeMooncell: !boolOpt(args, "no-mooncell"),
       includeAssets: !boolOpt(args, "no-assets"),
+      force: boolOpt(args, "force"),
       verbose: boolOpt(args, "verbose"),
     });
-    print(summary);
+    if (boolOpt(args, "json")) {
+      print(summary);
+    } else {
+      printSyncSummary(summary);
+    }
     return;
   }
 
@@ -212,6 +218,90 @@ function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function printSyncSummary(summary: SyncSummary): void {
+  const lines: string[] = [];
+  lines.push(summary.status === "ok" ? "同步完成" : "同步完成（部分成功）");
+  lines.push(`本次范围：${summary.regions.join(", ")}`);
+  lines.push(`数据源：${summary.fetched} 更新，${summary.unchanged} 未变化，${summary.skipped} 跳过，${summary.failed} 失败`);
+
+  const atlas = summary.databases.find((item) => item.name === "atlas");
+  const questIndex = summary.databases.find((item) => item.name === "quest_index");
+  const mooncell = summary.databases.find((item) => item.name === "mooncell");
+  if (atlas) lines.push(`Atlas：${statusText(atlas.status)}${statsText(atlas.stats)}`);
+  if (questIndex) lines.push(`常驻自由本羁绊数据：${statusText(questIndex.status)}${questIndexRegionsText(questIndex.regions)}`);
+  if (mooncell) lines.push(`Mooncell：${statusText(mooncell.status)}${mooncellDetail(summary)}`);
+
+  if (summary.counts?.regions.length) {
+    lines.push("");
+    lines.push("数据量：");
+    for (const region of summary.counts.regions) {
+      lines.push(
+        `${region.region}：从者 ${countEntity(region, "servant")}，礼装 ${countEntity(region, "equip")}，活动 ${countEntity(
+          region,
+          "event",
+        )}，战役 ${countEntity(region, "war")}，常驻自由本 ${region.questIndex}，卡池 ${region.banners}，资源 ${region.resources}`,
+      );
+    }
+  }
+
+  if (summary.failures.length > 0) {
+    lines.push("");
+    lines.push("失败明细：");
+    for (const failure of summary.failures.slice(0, 5)) {
+      lines.push(`- ${failure.id}：${shortError(failure.error)}`);
+    }
+    if (summary.failures.length > 5) lines.push(`- 还有 ${summary.failures.length - 5} 个失败，可运行 fgo status --limit 20 查看。`);
+    if (summary.failures.some((failure) => failure.source === "mooncell")) {
+      lines.push("提示：只同步核心 Atlas 数据可用 fgo sync --no-mooncell。");
+    }
+  }
+
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+function statusText(status: string): string {
+  switch (status) {
+    case "ok":
+      return "正常";
+    case "partial":
+      return "部分完成";
+    case "failed":
+      return "失败";
+    case "skipped":
+      return "未运行";
+    default:
+      return status;
+  }
+}
+
+function statsText(stats: SyncSummary["databases"][number]["stats"]): string {
+  if (!stats) return "";
+  return `（${stats.fetched} 更新，${stats.unchanged} 未变化，${stats.skipped} 跳过，${stats.failed} 失败）`;
+}
+
+function questIndexRegionsText(regions: SyncSummary["databases"][number]["regions"]): string {
+  if (!regions?.length) return "";
+  return `（${regions.map((region) => `${region.region} ${region.indexedQuests ?? 0}/${region.candidateQuests ?? 0}`).join("，")}）`;
+}
+
+function mooncellDetail(summary: SyncSummary): string {
+  const failure = summary.failures.find((item) => item.source === "mooncell");
+  if (failure) return `（${shortError(failure.error)}，预测卡池沿用旧数据）`;
+  return summary.banners > 0 ? `（更新 ${summary.banners} 个预测卡池）` : "";
+}
+
+function countEntity(region: NonNullable<SyncSummary["counts"]>["regions"][number], entityType: string): number {
+  return region.entities[entityType] ?? 0;
+}
+
+function shortError(error: string): string {
+  const timeout = error.match(/attempted address: ([^,]+), timeout: (\d+)ms/);
+  if (timeout) return `${timeout[1]} 连接超时（${Math.round(Number(timeout[2]) / 1000)}s）`;
+  const url = error.match(/https?:\/\/([^/?#]+)/);
+  if (url) return error.replace(/https?:\/\/[^:\s]+[^\s]*:/, `${url[1]}:`);
+  return error;
+}
+
 function printHelp(): void {
   process.stdout.write(`FGO Agent CLI
 
@@ -233,6 +323,8 @@ Usage:
 Options:
   --data-dir <path>  Override data directory. Default: ./.fgo-agent or FGO_AGENT_DATA_DIR.
   --region <code>   CN, JP, NA, KR, TW. Default: CN.
+  --force           Re-download and rebuild indexes even when upstream data is unchanged.
+  --json            Print the full sync result as JSON.
 `);
 }
 
